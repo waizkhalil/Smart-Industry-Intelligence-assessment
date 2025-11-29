@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+requests
+beautifulsoup4
+python-dotenv
+langchain==0.1.0
+langchain-google-genai>=1.0.0
+langchain-community
+faiss-cpu
+httpx
+sentence-transformers==2.2.2

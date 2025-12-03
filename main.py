@@ -1,24 +1,21 @@
+# main.py
 """
 Smart Industry Intelligence Pipeline — Final Version
-
-Scrapes all pages (1–11), stores data, summarizes, vectorizes,
-exposes API + WebSocket.
+Scrapes all pages (1–11), stores data, summarizes, vectorizes, exposes API + WebSocket.
 """
 
 import os
 import json
-import asyncio
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
-
 import httpx
 import numpy as np
 import faiss
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Query,  HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -53,7 +50,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 # ------------------------------------------------------------
@@ -65,8 +62,6 @@ SessionLocal = sessionmaker(bind=engine)
 
 
 class Article(Base):
-    """SQLAlchemy model for storing articles."""
-
     __tablename__ = "articles"
 
     id = Column(Integer, primary_key=True)
@@ -83,7 +78,7 @@ class Article(Base):
 Base.metadata.create_all(engine)
 
 # ------------------------------------------------------------
-# FAISS VECTOR STORE SETUP
+# FAISS VECTOR STORE SETUP (Robust, DB-first)
 # ------------------------------------------------------------
 EMBED_DIM = 384
 os.makedirs("data", exist_ok=True)
@@ -92,54 +87,75 @@ FAISS_META_PATH = "data/faiss_meta.json"
 
 embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
+# Load or create FAISS index
 if os.path.exists(FAISS_INDEX_PATH):
     faiss_index = faiss.read_index(FAISS_INDEX_PATH)
 else:
     faiss_index = faiss.IndexFlatL2(EMBED_DIM)
 
+# Load or initialize metadata
 if os.path.exists(FAISS_META_PATH):
     with open(FAISS_META_PATH, "r") as f:
         index_to_meta: Dict[str, dict] = json.load(f)
 else:
     index_to_meta = {}
 
+# Build docstore and index mapping
+docstore = InMemoryDocstore()
+index_to_docstore_id = {}
+
+# Load all articles from DB
+session = SessionLocal()
+all_articles = session.query(Article).all()
+session.close()
+
+for i, article in enumerate(all_articles):
+    vec_id = str(i)
+    # store article text in docstore
+    docstore.add({vec_id: article.content_body})
+    index_to_docstore_id[i] = vec_id
+    # if metadata missing, create
+    if vec_id not in index_to_meta:
+        index_to_meta[vec_id] = {
+            "title": article.title,
+            "url": article.url,
+            "tags": article.tags,
+        }
+
 vector_store = LangFAISS(
     embedding_function=embedder,
     index=faiss_index,
-    docstore=InMemoryDocstore(),
-    index_to_docstore_id={},
+    docstore=docstore,
+    index_to_docstore_id=index_to_docstore_id
 )
 
-
-def save_faiss() -> None:
-    """Persist FAISS index and metadata to disk."""
+def save_faiss():
     faiss.write_index(vector_store.index, FAISS_INDEX_PATH)
     with open(FAISS_META_PATH, "w") as f:
         json.dump(index_to_meta, f)
 
-
 def clean_vec(v: List[float]) -> np.ndarray:
-    """Convert list to np.float32 array."""
     return np.array([float(x) for x in v], dtype=np.float32)
 
-
-def add_embedding(text: str, meta: dict) -> None:
-    """Add a new embedding to FAISS vector store."""
+def add_article_embedding(article: Article):
+    """Add a new article to FAISS and metadata"""
     try:
-        emb = embedder.embed_query(text)
+        emb = embedder.embed_query(article.content_body)
         vec = clean_vec(emb)
         vector_store.index.add(np.array([vec], dtype=np.float32))
         new_id = str(len(index_to_meta))
-        index_to_meta[new_id] = meta
-        vector_store.index_to_docstore_id[len(index_to_meta) - 1] = new_id
-        vector_store.docstore.add({new_id: text})
+        index_to_meta[new_id] = {
+            "title": article.title,
+            "url": article.url,
+            "tags": article.tags,
+        }
+        vector_store.index_to_docstore_id[len(index_to_meta)-1] = new_id
+        vector_store.docstore.add({new_id: article.content_body})
         save_faiss()
     except Exception as e:
         logger.error("FAISS add error: %s", e)
 
-
 def vector_search(query: str, top_k: int = 5) -> List[dict]:
-    """Search FAISS vector store and return top_k results."""
     if vector_store.index.ntotal == 0:
         logger.warning("FAISS index empty! No results will be returned.")
         return []
@@ -153,23 +169,24 @@ def vector_search(query: str, top_k: int = 5) -> List[dict]:
             if idx < 0:
                 continue
             meta_id = vector_store.index_to_docstore_id.get(idx)
-            if meta_id:
-                meta = index_to_meta.get(meta_id)
-                if meta:
-                    results.append(meta)
+            if not meta_id:
+                continue
+            meta = index_to_meta.get(meta_id)
+            if meta:
+                results.append(meta)
         return results
     except Exception as e:
         logger.error("FAISS search error: %s", e)
         return []
 
+
 # ------------------------------------------------------------
-# LLM (Gemini) SETUP
+# LLM (Gemini) Setup
 # ------------------------------------------------------------
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
 
 
 def summarize(text: str) -> str:
-    """Generate a 3-sentence summary of the article."""
     try:
         prompt = f"Summarize this article in 3 concise sentences:\n\n{text}"
         return llm.invoke(prompt).content.strip()
@@ -179,7 +196,6 @@ def summarize(text: str) -> str:
 
 
 def generate_tags(text: str) -> List[str]:
-    """Generate up to 3 tags for an article."""
     try:
         prompt = (
             "Extract up to 3 short tags for this article. "
@@ -202,7 +218,7 @@ SCRAPE_STATUS = {
     "running": False,
     "total_found": 0,
     "processed": 0,
-    "finished": False,
+    "finished": False
 }
 
 # ------------------------------------------------------------
@@ -211,9 +227,7 @@ SCRAPE_STATUS = {
 BASE_URL = "https://techreviewer.co/blog"
 PAGE_PARAM_BASE = "https://techreviewer.co/blog?979539fa_page={page}"
 
-
 async def fetch(client: httpx.AsyncClient, url: str) -> str:
-    """Fetch page HTML content."""
     try:
         r = await client.get(url, timeout=20)
         r.raise_for_status()
@@ -224,7 +238,6 @@ async def fetch(client: httpx.AsyncClient, url: str) -> str:
 
 
 async def scrape_article(card, client: httpx.AsyncClient) -> Optional[Dict]:
-    """Scrape a single article from a card element."""
     try:
         title_tag = card.find("h3", class_="post-card-heading")
         title = title_tag.get_text(strip=True) if title_tag else "N/A"
@@ -245,7 +258,7 @@ async def scrape_article(card, client: httpx.AsyncClient) -> Optional[Dict]:
             "author": author,
             "date": date,
             "url": url,
-            "content_body": content,
+            "content_body": content
         }
     except Exception as e:
         logger.error("Scrape article failed: %s", e)
@@ -253,26 +266,24 @@ async def scrape_article(card, client: httpx.AsyncClient) -> Optional[Dict]:
 
 
 async def scrape_all_cards() -> List[BeautifulSoup]:
-    """Scrape all cards across pages 1–11."""
     cards = []
     async with httpx.AsyncClient(timeout=20) as client:
-        for page in range(1, 12):
+        for page in range(1, 12):  # pages 1 to 11 inclusive
             url = PAGE_PARAM_BASE.format(page=page)
             html = await fetch(client, url)
             if not html:
                 continue
             soup = BeautifulSoup(html, "html.parser")
             page_cards = soup.find_all("a", class_="post-card w-inline-block")
-            if page_cards:
-                cards.extend(page_cards)
+            if not page_cards:
+                continue
+            cards.extend(page_cards)
     return cards
 
 # ------------------------------------------------------------
 # WEBSOCKET MANAGER
 # ------------------------------------------------------------
 class WSManager:
-    """Manage active WebSocket connections."""
-
     def __init__(self):
         self.connections: List[WebSocket] = []
 
@@ -285,7 +296,6 @@ class WSManager:
             self.connections.remove(ws)
 
     async def broadcast(self, msg: str):
-        """Send message to all active connections."""
         to_remove = []
         for ws in self.connections:
             try:
@@ -301,7 +311,6 @@ ws_manager = WSManager()
 
 @app.websocket("/ws/updates")
 async def websocket_endpoint(ws: WebSocket):
-    """WebSocket endpoint for real-time article updates."""
     await ws_manager.connect(ws)
     try:
         while True:
@@ -312,8 +321,7 @@ async def websocket_endpoint(ws: WebSocket):
 # ------------------------------------------------------------
 # BACKGROUND SCRAPING TASK
 # ------------------------------------------------------------
-async def process_new_articles() -> None:
-    """Scrape, summarize, tag, store, and vectorize all new articles."""
+async def process_new_articles():
     SCRAPE_STATUS.update({"running": True, "total_found": 0, "processed": 0, "finished": False})
     session = SessionLocal()
     try:
@@ -323,33 +331,32 @@ async def process_new_articles() -> None:
 
         async with httpx.AsyncClient(timeout=20) as client:
             for card in cards:
-                article_data = await scrape_article(card, client)
-                if not article_data or not article_data.get("content_body"):
+                a = await scrape_article(card, client)
+                if not a or not a.get("content_body"):
+                    continue
+                # dedupe
+                if session.query(Article).filter_by(url=a["url"]).first():
                     continue
 
-                # Deduplicate
-                if session.query(Article).filter_by(url=article_data["url"]).first():
-                    continue
-
-                summary = summarize(article_data["content_body"])
-                tags = generate_tags(article_data["content_body"])
+                summary = summarize(a["content_body"])
+                tags = generate_tags(a["content_body"])
 
                 art = Article(
-                    title=article_data["title"],
-                    author=article_data.get("author"),
-                    date=article_data.get("date"),
-                    url=article_data["url"],
-                    content_body=article_data["content_body"],
+                    title=a["title"],
+                    author=a.get("author"),
+                    date=a.get("date"),
+                    url=a["url"],
+                    content_body=a["content_body"],
                     summary=summary,
-                    tags=tags,
+                    tags=tags
                 )
                 session.add(art)
                 session.commit()
 
-                add_embedding(article_data["content_body"], {"title": article_data["title"], "url": article_data["url"], "tags": tags})
+                add_embedding(a["content_body"], {"title": a["title"], "url": a["url"], "tags": tags})
 
                 SCRAPE_STATUS["processed"] += 1
-                await ws_manager.broadcast(f"New article added: {article_data['title']}")
+                await ws_manager.broadcast(f"New article added: {a['title']}")
 
         await ws_manager.broadcast(f"Scraping finished. Total saved: {SCRAPE_STATUS['processed']}")
     except Exception as e:
@@ -364,29 +371,47 @@ async def process_new_articles() -> None:
 # ------------------------------------------------------------
 @app.post("/scrape")
 async def start_scrape(background: BackgroundTasks):
-    """Trigger background scraping task."""
-    background.add_task(asyncio.run, process_new_articles())
+    background.add_task(process_new_articles)   # FIXED
     return {"message": "Scraping started"}
-
 
 @app.get("/scrape/status")
 def get_status():
-    """Return current scraping status."""
     return SCRAPE_STATUS
 
-
 @app.get("/articles")
-def get_articles(page: int = 1, limit: int = 10):
-    """Return paginated list of articles."""
+def get_articles(
+    page: int = 1,
+    limit: int = 10,
+    tag: Optional[str] = Query(None)
+):
     session = SessionLocal()
-    total = session.query(Article).count()
-    items = session.query(Article).offset((page - 1) * limit).limit(limit).all()
-    session.close()
+    # fetch all articles
+    articles = session.query(Article).all()
+
+    # filter by tag if provided (case-insensitive, trimmed)
+    if tag:
+        tag_clean = tag.strip().lower()
+        filtered = []
+        for a in articles:
+            if a.tags:
+                # check if any tag matches ignoring case and spaces
+                if any(tag_clean == t.strip().lower() for t in a.tags):
+                    filtered.append(a)
+        articles = filtered
+
+    # total count after filtering
+    total = len(articles)
+
+    # pagination (proper slicing)
+    start = (page - 1) * limit
+    end = start + limit
+    items = articles[start:end]
 
     return {
-        "total": total,
-        "page": page,
-        "limit": limit,
+        "total": total,           # total matching articles
+        "page": page,             # current page
+        "limit": limit,           # items per page
+        "pages": (total + limit - 1) // limit,  # total number of pages
         "articles": [
             {
                 "title": a.title,
@@ -397,16 +422,14 @@ def get_articles(page: int = 1, limit: int = 10):
                 "url": a.url,
             }
             for a in items
-        ],
+        ]
     }
 
-
+    
 class SearchQuery(BaseModel):
     query: str
 
-
 @app.post("/search")
 def search_articles(q: SearchQuery, top_k: int = 5):
-    """Search articles using vector embeddings."""
     res = vector_search(q.query, top_k)
     return {"query": q.query, "results": res}

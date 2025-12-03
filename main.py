@@ -1,6 +1,6 @@
 # main.py
 """
-Smart Industry Intelligence Pipeline — Final Version
+Smart Industry Intelligence Pipeline
 Scrapes all pages (1–11), stores data, summarizes, vectorizes, exposes API + WebSocket.
 """
 
@@ -433,3 +433,4 @@ class SearchQuery(BaseModel):
 def search_articles(q: SearchQuery, top_k: int = 5):
     res = vector_search(q.query, top_k)
     return {"query": q.query, "results": res}
+

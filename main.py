@@ -1,6 +1,6 @@
 # main.py
 """
-Smart Industry Intelligence Pipeline
+Smart Industry Intelligence Pipeline — Final Version
 Scrapes all pages (1–11), stores data, summarizes, vectorizes, exposes API + WebSocket.
 """
 
@@ -353,7 +353,7 @@ async def process_new_articles():
                 session.add(art)
                 session.commit()
 
-                add_embedding(a["content_body"], {"title": a["title"], "url": a["url"], "tags": tags})
+                add_article_embedding(art)
 
                 SCRAPE_STATUS["processed"] += 1
                 await ws_manager.broadcast(f"New article added: {a['title']}")
@@ -386,46 +386,49 @@ def get_articles(
 ):
     session = SessionLocal()
     # fetch all articles
-    articles = session.query(Article).all()
+    try:
+        articles = session.query(Article).all()
 
-    # filter by tag if provided (case-insensitive, trimmed)
-    if tag:
-        tag_clean = tag.strip().lower()
-        filtered = []
-        for a in articles:
-            if a.tags:
-                # check if any tag matches ignoring case and spaces
-                if any(tag_clean == t.strip().lower() for t in a.tags):
-                    filtered.append(a)
-        articles = filtered
+        # filter by tag if provided (case-insensitive, trimmed)
+        if tag:
+            tag_clean = tag.strip().lower()
+            filtered = []
+            for a in articles:
+                if a.tags:
+                    # check if any tag matches ignoring case and spaces
+                    if any(tag_clean == t.strip().lower() for t in a.tags):
+                        filtered.append(a)
+            articles = filtered
 
-    # total count after filtering
-    total = len(articles)
+        # total count after filtering
+        total = len(articles)
 
-    # pagination (proper slicing)
-    start = (page - 1) * limit
-    end = start + limit
-    items = articles[start:end]
+        # pagination (proper slicing)
+        start = (page - 1) * limit
+        end = start + limit
+        items = articles[start:end]
 
-    return {
-        "total": total,           # total matching articles
-        "page": page,             # current page
-        "limit": limit,           # items per page
-        "pages": (total + limit - 1) // limit,  # total number of pages
-        "articles": [
-            {
-                "title": a.title,
-                "author": a.author,
-                "date": a.date,
-                "summary": a.summary,
-                "tags": a.tags,
-                "url": a.url,
-            }
-            for a in items
-        ]
-    }
+        return {
+            "total": total,           # total matching articles
+            "page": page,             # current page
+            "limit": limit,           # items per page
+            "pages": (total + limit - 1) // limit,  # total number of pages
+            "articles": [
+                {
+                    "title": a.title,
+                    "author": a.author,
+                    "date": a.date,
+                    "summary": a.summary,
+                    "tags": a.tags,
+                    "url": a.url,
+                }
+                for a in items
+            ]
+        }
+        
+    finally:
+        session.close()
 
-    
 class SearchQuery(BaseModel):
     query: str
 
@@ -433,4 +436,3 @@ class SearchQuery(BaseModel):
 def search_articles(q: SearchQuery, top_k: int = 5):
     res = vector_search(q.query, top_k)
     return {"query": q.query, "results": res}
-
